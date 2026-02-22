@@ -9,7 +9,9 @@ import sys
 from pathlib import Path
 import time
 import argparse
-from datetime import datetime, timedelta
+import random
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
 
 # Auto-install dependencies
@@ -37,6 +39,15 @@ session.headers.update({
 })
 url_home = "https://indiankanoon.org"
 
+MAX_RETRIES = 5
+BASE_RETRY_SECONDS = 2.0
+MAX_RETRY_SECONDS = 60.0
+REQUEST_TIMEOUT_SECONDS = 45
+SUCCESS_DELAY_SECONDS = 1.2
+PAGE_DELAY_SECONDS = 2.0
+SEARCH_EMPTY_PAGE_RETRIES = 3
+DATE_FORMAT = "%d-%m-%Y"
+
 
 def calculate_date_range(days=7, from_date=None, to_date=None):
     """
@@ -51,10 +62,40 @@ def calculate_date_range(days=7, from_date=None, to_date=None):
     today = datetime.now()
     from_dt = today - timedelta(days=days-1)
     
-    from_date_str = from_dt.strftime("%d-%m-%Y")
-    to_date_str = today.strftime("%d-%m-%Y")
+    from_date_str = from_dt.strftime(DATE_FORMAT)
+    to_date_str = today.strftime(DATE_FORMAT)
     
     return from_date_str, to_date_str
+
+
+def parse_date(date_str):
+    """Parse DD-MM-YYYY date string."""
+    return datetime.strptime(date_str, DATE_FORMAT).date()
+
+
+def format_date(date_value):
+    """Format date object to DD-MM-YYYY string."""
+    return date_value.strftime(DATE_FORMAT)
+
+
+def generate_date_chunks(from_date, to_date, chunk_days):
+    """Split a date range into contiguous DD-MM-YYYY chunks."""
+    if chunk_days < 1:
+        raise ValueError("chunk_days must be >= 1")
+
+    start_date = parse_date(from_date)
+    end_date = parse_date(to_date)
+    if start_date > end_date:
+        raise ValueError(f"from-date must be <= to-date (got {from_date} > {to_date})")
+
+    chunks = []
+    current = start_date
+    while current <= end_date:
+        chunk_end = min(end_date, current + timedelta(days=chunk_days - 1))
+        chunks.append((format_date(current), format_date(chunk_end)))
+        current = chunk_end + timedelta(days=1)
+
+    return chunks
 
 
 def build_search_url(topic, from_date, to_date, page_num=0):
@@ -91,13 +132,109 @@ def build_search_url(topic, from_date, to_date, page_num=0):
 
 
 def crawler(url):
-    """Scrape content from web pages"""
-    try:
-        content = session.get(url).content
-        return bs(content, features="html.parser")
-    except Exception as e:
-        print(f"Error while fetching {url}: {e}")
+    """Fetch and parse a search page with retry/backoff for transient failures."""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+        except requests.RequestException as e:
+            if attempt >= MAX_RETRIES:
+                print(f"Error while fetching {url}: {e}")
+                return None
+            wait_seconds = get_backoff_seconds(attempt) + random.uniform(0.2, 1.0)
+            print(f"Search page network error. Retrying in {wait_seconds:.1f}s ({attempt + 1}/{MAX_RETRIES})")
+            time.sleep(wait_seconds)
+            continue
+
+        if response.status_code == 200:
+            return bs(response.content, features="html.parser")
+
+        if response.status_code in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
+            retry_after = parse_retry_after(response.headers.get('Retry-After'))
+            wait_base = retry_after if retry_after is not None else get_backoff_seconds(attempt)
+            wait_seconds = min(MAX_RETRY_SECONDS, wait_base) + random.uniform(0.2, 1.0)
+            print(f"Search page HTTP {response.status_code}. Retrying in {wait_seconds:.1f}s ({attempt + 1}/{MAX_RETRIES})")
+            time.sleep(wait_seconds)
+            continue
+
+        print(f"Search page failed: HTTP {response.status_code} ({url})")
         return None
+
+    print(f"Search page failed after retries: {url}")
+    return None
+
+
+def parse_retry_after(retry_after_header):
+    """
+    Parse Retry-After header value into seconds.
+    Supports both integer seconds and HTTP date format.
+    """
+    if not retry_after_header:
+        return None
+
+    value = str(retry_after_header).strip()
+    if value.isdigit():
+        return max(1, int(value))
+
+    try:
+        retry_at = parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+
+        wait_seconds = (retry_at.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+        if wait_seconds > 0:
+            return wait_seconds
+    except Exception:
+        pass
+
+    return None
+
+
+def get_backoff_seconds(attempt):
+    """Compute exponential backoff with an upper bound."""
+    return min(MAX_RETRY_SECONDS, BASE_RETRY_SECONDS * (2 ** attempt))
+
+
+def sanitize_title(title):
+    """Sanitize title to a filesystem-safe PDF name fragment."""
+    return title.replace('/', '-').replace('\\', '-')
+
+
+def build_pdf_path(save_path, title):
+    """Build the target PDF path for a document title."""
+    safe_title = sanitize_title(title)
+    return Path(save_path) / f"{safe_title}.pdf"
+
+
+def load_downloaded_ids(index_path):
+    """Load previously downloaded document IDs from disk."""
+    if not index_path.exists():
+        return set()
+
+    try:
+        with index_path.open("r", encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except Exception as e:
+        print(f"Warning: could not read {index_path}: {e}")
+        return set()
+
+
+def append_downloaded_id(index_path, doc_id):
+    """Append one downloaded document ID so runs can resume safely."""
+    try:
+        with index_path.open("a", encoding="utf-8") as f:
+            f.write(f"{doc_id}\n")
+    except Exception as e:
+        print(f"Warning: could not update {index_path}: {e}")
+
+
+def is_no_matching_results_page(soup):
+    """Detect the explicit 'No Matching results' page."""
+    if soup is None:
+        return False
+
+    title_text = soup.title.get_text(" ", strip=True).lower() if soup.title else ""
+    body_text = soup.get_text(" ", strip=True).lower()
+    return "no matching results" in title_text or "no matching results" in body_text
 
 
 def download_pdf(doc_id, save_path, title):
@@ -109,45 +246,68 @@ def download_pdf(doc_id, save_path, title):
         save_path: Directory to save the PDF
         title: Title for the PDF filename
     """
-    try:
-        # Use GET request with ?type=pdf parameter
-        doc_url = f"{url_home}/doc/{doc_id}/"
-        pdf_url = f"{doc_url}?type=pdf"
-        
-        print(f"Downloading: {title} (ID: {doc_id})")
-        
-        Path(save_path).mkdir(parents=True, exist_ok=True)
-        
-        # Include Referer header to avoid 403 errors
-        headers = {
-            'Referer': doc_url,
-            'Accept': 'application/pdf,application/x-pdf,*/*'
-        }
-        
-        # Make GET request for PDF
-        r = session.get(pdf_url, headers=headers)
-        
-        # Check if we got a PDF (not an error page)
+    # Use GET request with ?type=pdf parameter
+    doc_url = f"{url_home}/doc/{doc_id}/"
+    pdf_url = f"{doc_url}?type=pdf"
+
+    print(f"Downloading: {title} (ID: {doc_id})")
+    Path(save_path).mkdir(parents=True, exist_ok=True)
+
+    # Include Referer header to avoid 403 errors
+    headers = {
+        'Referer': doc_url,
+        'Accept': 'application/pdf,application/x-pdf,*/*'
+    }
+
+    filename = build_pdf_path(save_path, title)
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            r = session.get(pdf_url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+        except requests.RequestException as e:
+            if attempt >= MAX_RETRIES:
+                print(f"✗ Error downloading {doc_id}: {e}")
+                return False
+
+            wait_seconds = get_backoff_seconds(attempt) + random.uniform(0.2, 1.0)
+            print(f"Temporary network error. Retrying in {wait_seconds:.1f}s ({attempt + 1}/{MAX_RETRIES})")
+            time.sleep(wait_seconds)
+            continue
+
+        status_code = r.status_code
         content_type = r.headers.get('Content-Type', '')
-        if r.status_code != 200:
-            print(f"✗ Failed: HTTP {r.status_code}")
-            return
-        
-        if 'pdf' not in content_type.lower() and not r.content.startswith(b'%PDF'):
-            print(f"✗ Failed: Got {content_type} instead of PDF")
-            return
-        
-        # Sanitize filename
-        title = title.replace('/', '-').replace('\\', '-')
-        filename = Path(save_path) / f"{title}.pdf"
-        
-        filename.write_bytes(r.content)
-        print(f"✓ Saved: {filename}")
-        
-        time.sleep(0.5)  # Rate limiting
-        
-    except Exception as e:
-        print(f"✗ Error downloading {doc_id}: {e}")
+
+        if status_code == 200 and ('pdf' in content_type.lower() or r.content.startswith(b'%PDF')):
+            filename.write_bytes(r.content)
+            print(f"✓ Saved: {filename}")
+            time.sleep(SUCCESS_DELAY_SECONDS + random.uniform(0.1, 0.5))
+            return True
+
+        # Handle rate-limits and transient server failures with retries
+        if status_code in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
+            retry_after = parse_retry_after(r.headers.get('Retry-After'))
+            wait_base = retry_after if retry_after is not None else get_backoff_seconds(attempt)
+            wait_seconds = min(MAX_RETRY_SECONDS, wait_base) + random.uniform(0.2, 1.0)
+            print(f"HTTP {status_code}. Retrying in {wait_seconds:.1f}s ({attempt + 1}/{MAX_RETRIES})")
+            time.sleep(wait_seconds)
+            continue
+
+        if status_code != 200:
+            print(f"✗ Failed: HTTP {status_code}")
+            return False
+
+        # Non-PDF 200 responses are often anti-bot/rate-limit pages
+        if attempt < MAX_RETRIES:
+            wait_seconds = get_backoff_seconds(attempt) + random.uniform(0.2, 1.0)
+            print(f"Unexpected response ({content_type}). Retrying in {wait_seconds:.1f}s ({attempt + 1}/{MAX_RETRIES})")
+            time.sleep(wait_seconds)
+            continue
+
+        print(f"✗ Failed: Got {content_type} instead of PDF")
+        return False
+
+    print(f"✗ Failed: Retries exhausted for {doc_id}")
+    return False
 
 
 def extract_document_ids(soup):
@@ -237,8 +397,14 @@ def search_and_download(topic, from_date, to_date, output_dir="Documents"):
     # Create output directory structure
     topic_slug = topic.replace(' ', '_').replace('/', '-')
     save_path = f"{output_dir}/{topic_slug}"
+    Path(save_path).mkdir(parents=True, exist_ok=True)
+    index_path = Path(save_path) / ".downloaded_ids.txt"
+    downloaded_ids = load_downloaded_ids(index_path)
+    print(f"Resume index: {index_path} ({len(downloaded_ids)} IDs)")
     
     total_downloaded = 0
+    total_skipped = 0
+    total_failed = 0
     page_num = 0
     
     while True:
@@ -256,15 +422,70 @@ def search_and_download(topic, from_date, to_date, output_dir="Documents"):
         documents = extract_document_ids(soup)
         
         if not documents:
-            print("No more results found")
-            break
+            if is_no_matching_results_page(soup):
+                print("No more results found")
+                break
+
+            recovered = False
+            for retry in range(1, SEARCH_EMPTY_PAGE_RETRIES + 1):
+                wait_seconds = get_backoff_seconds(retry - 1) + random.uniform(0.2, 0.8)
+                print(
+                    f"No documents parsed on page {page_num + 1}. "
+                    f"Retrying page in {wait_seconds:.1f}s ({retry}/{SEARCH_EMPTY_PAGE_RETRIES})"
+                )
+                time.sleep(wait_seconds)
+
+                soup = crawler(search_url)
+                if not soup:
+                    continue
+
+                if is_no_matching_results_page(soup):
+                    print("No more results found")
+                    documents = []
+                    recovered = False
+                    break
+
+                documents = extract_document_ids(soup)
+                if documents:
+                    recovered = True
+                    print(f"Recovered page {page_num + 1} with {len(documents)} results")
+                    break
+
+            if not documents and is_no_matching_results_page(soup):
+                break
+
+            if not recovered and not documents:
+                print(
+                    "Stopped early: this page returned no documents after retries. "
+                    "Re-run later to continue from where you left off."
+                )
+                break
         
         print(f"Found {len(documents)} results on this page")
         
         # Download each document
         for doc_id, title in documents:
-            download_pdf(doc_id, save_path, title)
-            total_downloaded += 1
+            if doc_id in downloaded_ids:
+                print(f"↷ Skipping already downloaded ID: {doc_id}")
+                total_skipped += 1
+                continue
+
+            # Also skip if matching file already exists from earlier runs
+            # where no ID index was present yet.
+            existing_file = build_pdf_path(save_path, title)
+            if existing_file.exists():
+                print(f"↷ Skipping existing file: {existing_file.name} (ID: {doc_id})")
+                downloaded_ids.add(doc_id)
+                append_downloaded_id(index_path, doc_id)
+                total_skipped += 1
+                continue
+
+            if download_pdf(doc_id, save_path, title):
+                total_downloaded += 1
+                downloaded_ids.add(doc_id)
+                append_downloaded_id(index_path, doc_id)
+            else:
+                total_failed += 1
         
         # Check for next page
         if not has_next_page(soup):
@@ -272,13 +493,20 @@ def search_and_download(topic, from_date, to_date, output_dir="Documents"):
             break
         
         page_num += 1
-        time.sleep(1)  # Rate limiting between pages
+        time.sleep(PAGE_DELAY_SECONDS)  # Rate limiting between pages
     
     print(f"\n{'='*70}")
     print(f"✓ Download complete!")
-    print(f"Total documents downloaded: {total_downloaded}")
+    print(f"Successfully downloaded: {total_downloaded}")
+    print(f"Skipped (already present): {total_skipped}")
+    print(f"Failed downloads: {total_failed}")
     print(f"Saved to: {save_path}")
     print(f"{'='*70}\n")
+    return {
+        "downloaded": total_downloaded,
+        "skipped": total_skipped,
+        "failed": total_failed,
+    }
 
 
 def main():
@@ -295,6 +523,9 @@ Examples:
   
   # Download with custom date range
   python kanoon_search.py --topic "environmental law" --from-date 01-01-2026 --to-date 10-02-2026
+
+  # Auto-split one year into 30-day chunks
+  python kanoon_search.py --topic "food safety" --days 365 --chunk-days 30
         """
     )
     
@@ -330,12 +561,20 @@ Examples:
         default='Documents',
         help='Output directory for downloaded PDFs (default: Documents)'
     )
+
+    parser.add_argument(
+        '--chunk-days',
+        type=int,
+        help='Automatically split date range into chunk-sized windows (e.g., 30)'
+    )
     
     args = parser.parse_args()
     
     # Validate custom dates if provided
     if (args.from_date and not args.to_date) or (args.to_date and not args.from_date):
         parser.error("Both --from-date and --to-date must be provided together")
+    if args.chunk_days is not None and args.chunk_days < 1:
+        parser.error("--chunk-days must be >= 1")
     
     # Calculate date range
     from_date, to_date = calculate_date_range(
@@ -343,9 +582,43 @@ Examples:
         from_date=args.from_date,
         to_date=args.to_date
     )
-    
-    # Run the search and download
-    search_and_download(args.topic, from_date, to_date, args.output)
+
+    # Validate final resolved date range
+    try:
+        parse_date(from_date)
+        parse_date(to_date)
+    except ValueError:
+        parser.error("Dates must be in DD-MM-YYYY format")
+
+    # Run in auto-chunk mode or single-range mode
+    if args.chunk_days:
+        try:
+            chunks = generate_date_chunks(from_date, to_date, args.chunk_days)
+        except ValueError as e:
+            parser.error(str(e))
+
+        print(f"\nAuto chunk mode enabled: {len(chunks)} chunks of {args.chunk_days} day(s)")
+        total_downloaded = 0
+        total_skipped = 0
+        total_failed = 0
+
+        for i, (chunk_from, chunk_to) in enumerate(chunks, start=1):
+            print(f"\n{'#' * 70}")
+            print(f"Chunk {i}/{len(chunks)}: {chunk_from} to {chunk_to}")
+            print(f"{'#' * 70}")
+            stats = search_and_download(args.topic, chunk_from, chunk_to, args.output)
+            total_downloaded += stats["downloaded"]
+            total_skipped += stats["skipped"]
+            total_failed += stats["failed"]
+
+        print(f"\n{'='*70}")
+        print("✓ All chunks complete!")
+        print(f"Chunked total downloaded: {total_downloaded}")
+        print(f"Chunked total skipped: {total_skipped}")
+        print(f"Chunked total failed: {total_failed}")
+        print(f"{'='*70}\n")
+    else:
+        search_and_download(args.topic, from_date, to_date, args.output)
 
 
 if __name__ == '__main__':

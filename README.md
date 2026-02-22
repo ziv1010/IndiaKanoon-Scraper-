@@ -1,131 +1,131 @@
-# Indian Kanoon Scraper - Usage Guide
+# Indian Kanoon Scraper
 
 ## Overview
 
-This project contains two scripts for downloading judgments from [IndianKanoon.org](https://indiankanoon.org):
+This project contains two scripts:
 
-1. **`kanoon.py`** - Original script that browses all courts by year/month
-2. **`kanoon_search.py`** - New search-based script with topic filtering ✨
+1. `kanoon.py` - original browse-based scraper
+2. `kanoon_search.py` - search-based scraper with date filtering, retries, resume support, and chunked runs
 
-## Quick Start with Search-Based Scraper
+The search scraper targets judgments on [IndianKanoon.org](https://indiankanoon.org).
 
-### Basic Usage - "This Week" (Last 7 Days)
+## Quick Start
+
+Run from this folder:
+
+```bash
+cd indian-kanoon
+python kanoon_search.py
+```
+
+Default behavior:
+
+- Topic: `Food Safety`
+- Date range: last `365` days
+- Type: `judgments`
+- Sort: `mostrecent`
+- Output: `Documents/Food_Safety/`
+
+## Common Usage
+
+Download by topic (default 365 days):
 
 ```bash
 python kanoon_search.py --topic "food safety"
 ```
 
-This will:
-- Search for "food safety" judgments
-- Download only from the **last 7 days** (Feb 3-10, 2026)
-- Filter for **judgments only** (not articles, etc.)
-- Sort by **most recent** first
-- Save to `Documents/food_safety/`
-
-### Custom Date Range (Last 30 Days)
-
-```bash
-python kanoon_search.py --topic "food safety" --days 30
-```
-
-### Specific Date Range
+Custom date range:
 
 ```bash
 python kanoon_search.py --topic "environmental law" --from-date 01-01-2026 --to-date 10-02-2026
 ```
 
-### Custom Output Directory
+Custom output directory:
 
 ```bash
-python kanoon_search.py --topic "food safety" --output /path/to/custom/folder
+python kanoon_search.py --topic "food safety" --output /path/to/output
+```
+
+Auto-chunk a large range (recommended for long ranges):
+
+```bash
+python kanoon_search.py --topic "food safety" --days 365 --chunk-days 30
 ```
 
 ## Command-Line Options
 
-| Option | Description | Default | Required |
-|--------|-------------|---------|----------|
-| `--topic` | Search topic/keywords | - | ✅ Yes |
-| `--days` | Days to look back from today | 7 | No |
-| `--from-date` | Custom start date (DD-MM-YYYY) | - | No* |
-| `--to-date` | Custom end date (DD-MM-YYYY) | - | No* |
-| `--output` | Output directory | `Documents` | No |
+| Option | Description | Default |
+|---|---|---|
+| `--topic` | Search topic/keywords | `Food Safety` |
+| `--days` | Days to look back from today | `365` |
+| `--from-date` | Start date (`DD-MM-YYYY`) | none |
+| `--to-date` | End date (`DD-MM-YYYY`) | none |
+| `--output` | Output directory | `Documents` |
+| `--chunk-days` | Split selected date range into N-day chunks | disabled |
 
-*Both `--from-date` and `--to-date` must be provided together
+Notes:
 
-## Examples
+- `--from-date` and `--to-date` must be provided together.
+- `--chunk-days` can be combined with either `--days` or explicit dates.
 
-### Download recent food safety judgments
-```bash
-python kanoon_search.py --topic "food safety"
-```
+## Resume and Dedup Behavior
 
-### Download environmental law cases from January 2026
-```bash
-python kanoon_search.py --topic "environmental law" --from-date 01-01-2026 --to-date 31-01-2026
-```
+Each topic folder keeps an index file:
 
-### Download consumer protection cases from last 2 weeks
-```bash
-python kanoon_search.py --topic "consumer protection" --days 14
-```
+- `Documents/<Topic_Slug>/.downloaded_ids.txt`
+
+On rerun, the scraper:
+
+1. Skips document IDs already in this index
+2. Skips if target PDF file already exists (useful for first run after adding resume logic)
+3. Appends newly downloaded IDs to the index
+
+## Retry and Rate-Limit Handling
+
+The scraper includes:
+
+- retry with exponential backoff + jitter for transient network errors
+- retry on HTTP `429`, `500`, `502`, `503`, `504`
+- `Retry-After` header support when present
+- extra retries for empty/transient search pages before deciding to stop
+
+## Important Pagination Limit
+
+Indian Kanoon search results are effectively capped (about 400 results / 40 pages per query in many cases).  
+If you need more coverage, use `--chunk-days` (for example `30`, `14`, or `7`) to split the range automatically.
 
 ## Output Structure
 
-PDFs are saved in the following structure:
-```
+```text
 Documents/
-└── food_safety/          # Topic name (spaces replaced with underscores)
+└── Food_Safety/
     ├── Case_Title_1.pdf
     ├── Case_Title_2.pdf
-    └── ...
+    └── .downloaded_ids.txt
 ```
-
-## Features
-
-✨ **Topic-based search** - Search for specific legal topics  
-📅 **Smart date filtering** - Automatic "this week" or custom ranges  
-⚖️ **Judgment-only filter** - Downloads only court judgments  
-🔄 **Automatic pagination** - Handles all search result pages  
-⏱️ **Rate limiting** - Built-in delays to respect server limits  
-📦 **Auto-install dependencies** - Automatically installs required packages  
 
 ## Requirements
 
 - Python 3.x
 - Internet connection
 
-Dependencies are installed automatically:
-- `cfscrape` - For bypassing Cloudflare protection
-- `beautifulsoup4` - For HTML parsing
-- `requests` - For HTTP requests
+Dependencies used:
 
-## Original Browse-Based Scraper
+- `requests`
+- `beautifulsoup4`
 
-To use the original scraper that downloads all courts/years/months:
+The script attempts to auto-install missing dependencies.
+
+## Original Script
+
+To run the original browse-based scraper:
 
 ```bash
 python kanoon.py
 ```
 
-⚠️ **Warning**: This will download thousands of files and take hours/days!
+## Help
 
-## Troubleshooting
-
-**Script says "No results found"**  
-- Try adjusting your date range (the topic might not have recent cases)
-- Try a broader search topic
-
-**PDFs not downloading**  
-- Check your internet connection
-- The site might have rate-limited you (wait a few minutes)
-
-**ModuleNotFoundError**  
-- The script should auto-install dependencies
-- If it fails, manually run: `pip install cfscrape beautifulsoup4`
-
-## Need Help?
-
-View all available options:
 ```bash
 python kanoon_search.py --help
 ```
