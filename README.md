@@ -116,6 +116,50 @@ Dependencies used:
 
 The script attempts to auto-install missing dependencies.
 
+## PDF to TXT Conversion
+
+Use `pdf_to_txt.py` to convert one PDF or an entire folder of PDFs into UTF-8 `.txt` files.
+
+### Setup
+
+```bash
+cd indian-kanoon
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-pdf.txt
+```
+
+Optional OCR fallback (for scanned/image-only PDFs):
+
+```bash
+brew install tesseract
+```
+
+### Convert a Single PDF
+
+```bash
+python pdf_to_txt.py \
+  --input "/absolute/path/to/file.pdf" \
+  --output-dir "/absolute/path/to/output-folder" \
+  --ocr --overwrite
+```
+
+### Convert a Full Folder
+
+```bash
+python pdf_to_txt.py \
+  --input "/absolute/path/to/pdf-folder" \
+  --output-dir "/absolute/path/to/output-folder" \
+  --ocr --overwrite
+```
+
+### Useful Notes
+
+- Without `--overwrite`, existing `.txt` files are skipped.
+- `--ocr` is fallback-only: embedded PDF text is used first, OCR is used only when needed.
+- You can add `--recursive` to scan subfolders.
+- Output files keep the same base filename as the source PDF.
+
 ## Original Script
 
 To run the original browse-based scraper:
